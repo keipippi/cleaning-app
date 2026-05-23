@@ -27,12 +27,12 @@ st.markdown("""
 # =========================
 DEFAULT_MEMBERS = [
     "Kawakami", "Kawano", "Yu", "Yong Sen", "Nia", "Shu",
-    "Sarah", "Felix", "Komiyama", "Sumi", "Takahashi", "Nishimiya"
+    "Sarah", "Komiyama", "Sumi", "Takahashi", "Nishimiya"
 ]
 
 DEFAULT_GROUP_A = ["Yu", "Yong Sen", "Nia", "Shu"]
 
-DEFAULT_GROUP_B = ["Sarah", "Felix", "Komiyama", "Sumi", "Takahashi", "Nishimiya"]
+DEFAULT_GROUP_B = ["Sarah", "Komiyama", "Sumi", "Takahashi", "Nishimiya"]
 
 EXCLUDED_SR = {"Kawakami", "Kawano"}
 MONDAY_PRIORITY_TASKS = {"Chip Tube", "Autoclave Waste", "Student Room", "Consumable Goods"}
