@@ -1,38 +1,41 @@
+import io
+import json
 import random
 import re
-from collections import deque, defaultdict
-from typing import Optional, List, Set, Dict, Deque, Tuple
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
+
+
+# =========================
+# Page settings
+# =========================
 st.set_page_config(page_title="Lab Cleaning Scheduler", layout="wide")
-
-st.title("🧹 Weekly Cleaning Scheduler")
-
-st.markdown("""
-- Vacuum / Mop / Garbage / Student Room は人数が多め（Vacuum, Mop=3、Garbage, Student Room=2）
-- Water alcohol, Chip Tube, Autoclave Waste, Autoclave Drain, Drying Racks, Consumable Goods は各1人
-- Liquid Waste は指定した週だけ+1人
-- Kawakami / Kawano は Student Room から除外
-- Unavailable に入れた人は完全に除外
-- Monday-unavailable は Chip Tube / Autoclave Waste / Student Room / Consumable Goods を優先
-- Friday-unavailable は Chip Tube / Autoclave Waste から除外
-- 人数が足りないときは Vacuum→Mop→Drying Racks の順で自動で枠を減らす（Vacuum/Mop/Garbage/Student Room は最低2人）
-""")
 
 
 # =========================
 # Constants
 # =========================
+LOCAL_CONFIG_PATH = Path("cleaning_config.json")
+SHEET_TAB_NAME = "settings"
+
 DEFAULT_MEMBERS = [
     "Kawakami", "Kawano", "Yu", "Yong Sen", "Nia", "Shu",
-    "Sarah", "Komiyama", "Sumi", "Takahashi", "Nishimiya"
+    "Sarah", "Felix", "Komiyama", "Sumi", "Takahashi", "Nishimiya",
 ]
-
 DEFAULT_GROUP_A = ["Yu", "Yong Sen", "Nia", "Shu"]
-
-DEFAULT_GROUP_B = ["Sarah", "Komiyama", "Sumi", "Takahashi", "Nishimiya"]
+DEFAULT_GROUP_B = ["Sarah", "Felix", "Komiyama", "Sumi", "Takahashi", "Nishimiya"]
 
 EXCLUDED_SR = {"Kawakami", "Kawano"}
 MONDAY_PRIORITY_TASKS = {"Chip Tube", "Autoclave Waste", "Student Room", "Consumable Goods"}
@@ -62,13 +65,14 @@ ADJUST_MIN = {
     "Water alcohol": 1,
     "Consumable Goods": 1,
 }
-ORDERED_TASKS = [
+TASK_ORDER = [
     "Chip Tube",
     "Autoclave Waste",
     "Autoclave Drain",
     "Vacuum",
     "Mop",
     "Garbage",
+    "Student Room",
     "Drying Racks",
     "Water alcohol",
     "Consumable Goods",
@@ -76,10 +80,10 @@ ORDERED_TASKS = [
 
 
 # =========================
-# Helpers
+# Text parsing
 # =========================
 def normalize_multiline(text: str) -> str:
-    parts = re.split(r"[,/\n]+", text)
+    parts = re.split(r"[,/\n、]+", text)
     names = [p.strip() for p in parts if p.strip()]
     return "\n".join(names)
 
@@ -92,27 +96,148 @@ def parse_name_set(text: str) -> Set[str]:
     return set(parse_name_list(text))
 
 
-def parse_liquid_weeks(text: str, max_weeks: int) -> Set[int]:
-    result = set()
-    for token in text.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            week = int(token)
-            if 1 <= week <= max_weeks:
-                result.add(week)
-        except ValueError:
-            pass
+def unique_keep_order(names: List[str]) -> List[str]:
+    seen = set()
+    result = []
+    for name in names:
+        if name and name not in seen:
+            seen.add(name)
+            result.append(name)
     return result
 
 
+# =========================
+# Settings persistence
+# =========================
+def default_config() -> Dict[str, List[str]]:
+    return {
+        "members": DEFAULT_MEMBERS,
+        "group_A": DEFAULT_GROUP_A,
+        "group_B": DEFAULT_GROUP_B,
+    }
+
+
+def sheet_is_available() -> bool:
+    return (
+        gspread is not None
+        and Credentials is not None
+        and "gcp_service_account" in st.secrets
+        and "SPREADSHEET_NAME" in st.secrets
+    )
+
+
+def get_worksheet():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=scopes,
+    )
+    client = gspread.authorize(creds)
+    spreadsheet = client.open(st.secrets["SPREADSHEET_NAME"])
+
+    try:
+        worksheet = spreadsheet.worksheet(SHEET_TAB_NAME)
+    except Exception:
+        worksheet = spreadsheet.add_worksheet(title=SHEET_TAB_NAME, rows=100, cols=2)
+        worksheet.update("A1:B1", [["type", "name"]])
+
+    return worksheet
+
+
+def load_config_from_sheet() -> Optional[Dict[str, List[str]]]:
+    if not sheet_is_available():
+        return None
+
+    try:
+        worksheet = get_worksheet()
+        records = worksheet.get_all_records()
+
+        members = [str(r.get("name", "")).strip() for r in records if r.get("type") == "members"]
+        group_A = [str(r.get("name", "")).strip() for r in records if r.get("type") == "group_A"]
+        group_B = [str(r.get("name", "")).strip() for r in records if r.get("type") == "group_B"]
+
+        members = unique_keep_order([m for m in members if m])
+        group_A = unique_keep_order([m for m in group_A if m])
+        group_B = unique_keep_order([m for m in group_B if m])
+
+        if members and group_A and group_B:
+            return {"members": members, "group_A": group_A, "group_B": group_B}
+    except Exception as e:
+        st.warning("Googleスプレッドシートから設定を読み込めませんでした。ローカル/初期設定を使います。")
+        st.caption(str(e))
+
+    return None
+
+
+def save_config_to_sheet(members: List[str], group_A: List[str], group_B: List[str]) -> bool:
+    if not sheet_is_available():
+        return False
+
+    try:
+        worksheet = get_worksheet()
+        rows = [["type", "name"]]
+        rows += [["members", name] for name in members]
+        rows += [["group_A", name] for name in group_A]
+        rows += [["group_B", name] for name in group_B]
+
+        worksheet.clear()
+        worksheet.update("A1:B{}".format(len(rows)), rows)
+        return True
+    except Exception as e:
+        st.warning("Googleスプレッドシートへの保存に失敗しました。ローカル保存を試します。")
+        st.caption(str(e))
+        return False
+
+
+def load_config_from_local() -> Optional[Dict[str, List[str]]]:
+    if not LOCAL_CONFIG_PATH.exists():
+        return None
+
+    try:
+        data = json.loads(LOCAL_CONFIG_PATH.read_text(encoding="utf-8"))
+        if data.get("members") and data.get("group_A") and data.get("group_B"):
+            return data
+    except Exception:
+        return None
+
+    return None
+
+
+def save_config_to_local(members: List[str], group_A: List[str], group_B: List[str]) -> bool:
+    try:
+        data = {"members": members, "group_A": group_A, "group_B": group_B}
+        LOCAL_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception as e:
+        st.warning("ローカル保存に失敗しました。")
+        st.caption(str(e))
+        return False
+
+
+def load_config() -> Dict[str, List[str]]:
+    return load_config_from_sheet() or load_config_from_local() or default_config()
+
+
+def save_config(members: List[str], group_A: List[str], group_B: List[str]) -> str:
+    if save_config_to_sheet(members, group_A, group_B):
+        return "Googleスプレッドシートに設定を保存しました。"
+    if save_config_to_local(members, group_A, group_B):
+        return "ローカルに設定を保存しました。Google Sheets Secretsを設定すると、サイト再起動後もより安定して保存できます。"
+    return "設定保存に失敗しました。"
+
+
+# =========================
+# Scheduling logic
+# =========================
 def adapt_counts(available_count: int, has_liquid: bool) -> Tuple[Dict[str, int], List[str]]:
     counts = dict(BASE_COUNTS)
     warnings = []
-
     total_slots = sum(counts.values()) + (1 if has_liquid else 0)
     deficit = total_slots - available_count
+
     if deficit <= 0:
         return counts, warnings
 
@@ -126,7 +251,6 @@ def adapt_counts(available_count: int, has_liquid: bool) -> Tuple[Dict[str, int]
 
     while deficit > 0:
         changed = False
-
         changed = reduce_slot("Vacuum") or changed
         if deficit > 0:
             changed = reduce_slot("Mop") or changed
@@ -148,14 +272,11 @@ def adapt_counts(available_count: int, has_liquid: bool) -> Tuple[Dict[str, int]
 
 
 def build_slots(counts: Dict[str, int], has_liquid: bool) -> List[str]:
-    slots = []
+    slots = ["Student Room (A)", "Student Room (B)"]
 
-    if counts["Student Room"] >= 2:
-        slots.extend(["Student Room (A)", "Student Room (B)"])
-    elif counts["Student Room"] == 1:
-        slots.append("Student Room (A)")
-
-    for task in ORDERED_TASKS:
+    for task in TASK_ORDER:
+        if task == "Student Room":
+            continue
         slots.extend([task] * counts[task])
 
     if has_liquid:
@@ -166,37 +287,13 @@ def build_slots(counts: Dict[str, int], has_liquid: bool) -> List[str]:
 
 def pick_candidate(
     dq: Deque[str],
-    used_this_week: Set[str],
-    last_task: Dict[str, Optional[str]],
+    used_this_round: Set[str],
     task_name: str,
     required_group: Optional[Set[str]] = None,
     preferred: Optional[Set[str]] = None,
     blacklist: Optional[Set[str]] = None,
 ) -> Tuple[Optional[str], Deque[str]]:
     blacklist = blacklist or set()
-
-    def try_pick(order: List[str], relax_same: bool = False) -> Tuple[Optional[str], Deque[str]]:
-        tmp = deque(order)
-        remaining_checks = len(tmp)
-
-        while remaining_checks > 0:
-            cand = tmp[0]
-            tmp.rotate(-1)
-            remaining_checks -= 1
-
-            if cand in used_this_week:
-                continue
-            if cand in blacklist:
-                continue
-            if required_group and cand not in required_group:
-                continue
-            if (not relax_same) and last_task.get(cand) == task_name:
-                continue
-
-            return cand, tmp
-
-        return None, dq
-
     candidate_orders = []
 
     if preferred:
@@ -207,35 +304,47 @@ def pick_candidate(
     candidate_orders.append(list(dq))
 
     for order in candidate_orders:
-        cand, newdq = try_pick(order, relax_same=False)
-        if cand:
-            return cand, newdq
+        tmp = deque(order)
+        for _ in range(len(tmp)):
+            cand = tmp[0]
+            tmp.rotate(-1)
 
-    for order in candidate_orders:
-        cand, newdq = try_pick(order, relax_same=True)
-        if cand:
-            return cand, newdq
+            if cand in used_this_round:
+                continue
+            if cand in blacklist:
+                continue
+            if required_group and cand not in required_group:
+                continue
+
+            return cand, tmp
 
     return None, dq
 
 
-def assign_one_week(
-    start_deque: Deque[str],
-    last_task: Dict[str, Optional[str]],
-    has_liquid: bool,
-    counts: Dict[str, int],
-    group_A_eff: Set[str],
-    group_B_eff: Set[str],
+def assign_schedule(
+    members: List[str],
     unavailable: Set[str],
     monday_unavail: Set[str],
     friday_unavail: Set[str],
-) -> Tuple[Dict[str, List[str]], Deque[str], List[str]]:
-    used = set()
-    dq = deque(start_deque)
-    assigned = defaultdict(list)
-    unfilled = []
+    group_A_eff: Set[str],
+    group_B_eff: Set[str],
+    has_liquid: bool,
+) -> Tuple[Dict[str, List[str]], Dict[str, int], List[str], List[str], List[str]]:
+    available_members = [m for m in members if m not in unavailable]
+    if not available_members:
+        st.error("参加可能なメンバーが0人です。")
+        st.stop()
 
+    counts, warnings = adapt_counts(len(available_members), has_liquid)
     slots = build_slots(counts, has_liquid)
+
+    dq_list = sorted(available_members)
+    random.shuffle(dq_list)
+    dq = deque(dq_list)
+
+    assigned = defaultdict(list)
+    used = set()
+    unfilled = []
     base_blacklist = set(unavailable)
 
     for slot in slots:
@@ -244,17 +353,16 @@ def assign_one_week(
             cand, dq = pick_candidate(
                 dq,
                 used,
-                last_task,
                 "Student Room",
                 required_group=group_A_eff,
                 preferred=preferred if preferred else None,
                 blacklist=base_blacklist | EXCLUDED_SR,
             )
-            if not cand:
+            if cand:
+                assigned["Student Room"].append(cand)
+                used.add(cand)
+            else:
                 unfilled.append(slot)
-                continue
-            assigned["Student Room"].append(cand)
-            used.add(cand)
             continue
 
         if slot == "Student Room (B)":
@@ -262,173 +370,180 @@ def assign_one_week(
             cand, dq = pick_candidate(
                 dq,
                 used,
-                last_task,
                 "Student Room",
                 required_group=group_B_eff,
                 preferred=preferred if preferred else None,
                 blacklist=base_blacklist | EXCLUDED_SR,
             )
-            if not cand:
+            if cand:
+                assigned["Student Room"].append(cand)
+                used.add(cand)
+            else:
                 unfilled.append(slot)
-                continue
-            assigned["Student Room"].append(cand)
-            used.add(cand)
             continue
 
         preferred = monday_unavail if slot in MONDAY_PRIORITY_TASKS else None
         blacklist = set(base_blacklist)
-
         if slot in FRIDAY_BLOCK_TASKS:
             blacklist |= friday_unavail
 
         cand, dq = pick_candidate(
             dq,
             used,
-            last_task,
             slot,
             preferred=preferred,
             blacklist=blacklist,
         )
-        if not cand:
+
+        if cand:
+            assigned[slot].append(cand)
+            used.add(cand)
+        else:
             unfilled.append(slot)
-            continue
 
-        assigned[slot].append(cand)
-        used.add(cand)
-
-    new_start = deque(start_deque)
-    new_start.rotate(-5 if len(new_start) >= 6 else -1)
-
-    return dict(assigned), new_start, unfilled
+    return dict(assigned), counts, warnings, unfilled, available_members
 
 
-def build_schedule(
-    members: List[str],
-    unavailable: Set[str],
-    monday_unavail: Set[str],
-    friday_unavail: Set[str],
-    weeks: int,
-    liquid_weeks: Set[int],
-    group_A_eff: Set[str],
-    group_B_eff: Set[str],
-) -> Tuple[List[str], List[Dict[str, List[str]]], List[Tuple[Dict[str, int], List[str], List[str]]]]:
-    available_members = [m for m in members if m not in unavailable]
-    if not available_members:
-        st.error("参加可能なメンバーが0人です。")
-        st.stop()
-
-    dq_list = sorted(available_members)
-    random.shuffle(dq_list)
-    dq = deque(dq_list)
-
-    last_task = {m: None for m in available_members}
-    all_weeks = []
-    info = []
-
-    for week in range(1, weeks + 1):
-        has_liquid = week in liquid_weeks
-        counts, warns = adapt_counts(len(available_members), has_liquid)
-        week_assign, dq, unfilled = assign_one_week(
-            dq,
-            last_task,
-            has_liquid,
-            counts,
-            group_A_eff,
-            group_B_eff,
-            unavailable,
-            monday_unavail,
-            friday_unavail,
-        )
-
-        for task_name, people in week_assign.items():
-            for person in people:
-                last_task[person] = task_name
-
-        all_weeks.append(week_assign)
-        info.append((counts, warns, unfilled))
-
-    return available_members, all_weeks, info
-
-
-def join_names(value) -> str:
-    return ", ".join(value) if isinstance(value, list) else (value or "-")
-
-
-def make_schedule_dataframe(all_weeks: List[Dict[str, List[str]]], liquid_weeks: Set[int]) -> Tuple[pd.DataFrame, List[str]]:
-    task_columns = [
-        "Chip Tube",
-        "Autoclave Waste",
-        "Autoclave Drain",
-        "Vacuum",
-        "Mop",
-        "Garbage",
-        "Student Room",
-        "Drying Racks",
-        "Water alcohol",
-        "Consumable Goods",
-    ]
-    if liquid_weeks:
-        task_columns = ["Liquid Waste"] + task_columns
+def make_schedule_dataframe(assigned: Dict[str, List[str]], has_liquid: bool) -> pd.DataFrame:
+    tasks = TASK_ORDER.copy()
+    if has_liquid:
+        tasks = ["Liquid Waste"] + tasks
 
     rows = []
-    for i, week_assign in enumerate(all_weeks, start=1):
-        row = {"Week": "Week {0}".format(i)}
-        for col in task_columns:
-            row[col] = join_names(week_assign.get(col, []))
-        rows.append(row)
+    for task in tasks:
+        people = assigned.get(task, [])
+        rows.append({"Cleaning Area": task, "Member": ", ".join(people) if people else "-"})
 
-    return pd.DataFrame(rows), task_columns
+    return pd.DataFrame(rows)
 
 
-def make_count_dataframe(df: pd.DataFrame, task_columns: List[str], available_members: List[str]) -> pd.DataFrame:
-    counts = {m: 0 for m in available_members}
-    for _, row in df.iterrows():
-        for col in task_columns:
-            names = row[col]
-            if names and names != "-":
-                for name in [x.strip() for x in names.split(",")]:
-                    if name in counts:
-                        counts[name] += 1
-    return pd.DataFrame(sorted(counts.items()), columns=["Member", "Total Assignments"])
+def make_png_bytes(df: pd.DataFrame) -> bytes:
+    height = max(4.0, 0.48 * len(df) + 1.2)
+    fig, ax = plt.subplots(figsize=(8.5, height))
+    ax.axis("off")
+    ax.set_title("Cleaning Duty", fontsize=18, pad=16)
 
+    table = ax.table(
+        cellText=df.values,
+        colLabels=df.columns,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    table.scale(1, 1.55)
 
-# =========================
-# Sidebar
-# =========================
-with st.sidebar:
-    st.header("⚙️ Settings")
-
-    members_text_raw = st.text_area("Members (one per line)", value="\n".join(DEFAULT_MEMBERS), height=260)
-    group_A_text_raw = st.text_area("Student Room Group A", value="\n".join(DEFAULT_GROUP_A), height=120)
-    group_B_text_raw = st.text_area("Student Room Group B", value="\n".join(DEFAULT_GROUP_B), height=140)
-
-    st.markdown("---")
-    st.subheader("🚫 Unavailable members (全週参加不可)")
-    unavail_raw = st.text_area("参加できないメンバー（1行1人）", value="", height=100)
-
-    st.subheader("🗓 Monday-unavailable members")
-    monday_raw = st.text_area("月曜に来れないメンバー（1行1人）", value="", height=100)
-
-    st.subheader("🗓 Friday-unavailable members")
-    friday_raw = st.text_area("金曜に来れないメンバー（1行1人）", value="", height=100)
-
-    members = parse_name_list(members_text_raw)
-    group_A = parse_name_set(group_A_text_raw)
-    group_B = parse_name_set(group_B_text_raw)
-    unavailable = parse_name_set(unavail_raw)
-    monday_unavail = parse_name_set(monday_raw)
-    friday_unavail = parse_name_set(friday_raw)
-
-    weeks = st.number_input("Number of weeks", min_value=4, max_value=52, value=8)
-    liquid_weeks_input = st.text_input("Liquid Waste weeks (例: 1,3,5)")
-    liquid_weeks = parse_liquid_weeks(liquid_weeks_input, weeks)
-
-    generate = st.button("🔁 Generate / Regenerate")
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 # =========================
-# Validation
+# Styling
 # =========================
+def apply_mobile_style():
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1rem;
+            padding-left: 0.8rem;
+            padding-right: 0.8rem;
+            max-width: 760px;
+        }
+        textarea, input, button {
+            font-size: 16px !important;
+        }
+        .stButton > button, .stDownloadButton > button {
+            width: 100%;
+            border-radius: 0.8rem;
+            min-height: 3rem;
+        }
+        div[data-testid="stDataFrame"] {
+            font-size: 14px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def apply_pc_style():
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1.5rem;
+            max-width: 1200px;
+        }
+        .stButton > button, .stDownloadButton > button {
+            border-radius: 0.7rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =========================
+# UI
+# =========================
+config = load_config()
+
+st.title("🧹 Cleaning Duty Scheduler")
+st.caption("毎週木曜日に当番を作成し、その週の金曜日・翌週月曜日に掃除する想定の1回分作成アプリです。")
+
+view_mode = st.radio("表示モード", ["スマホ版", "パソコン版"], horizontal=True)
+if view_mode == "スマホ版":
+    apply_mobile_style()
+else:
+    apply_pc_style()
+
+if sheet_is_available():
+    st.success("Googleスプレッドシート連携：有効")
+else:
+    st.info("Googleスプレッドシート連携：未設定。設定保存はローカル保存になります。")
+
+if "last_result" not in st.session_state:
+    st.session_state["last_result"] = None
+
+
+def input_area():
+    members_raw = st.text_area("Members", value="\n".join(config["members"]), height=220)
+    group_A_raw = st.text_area("Student Room Group A", value="\n".join(config["group_A"]), height=120)
+    group_B_raw = st.text_area("Student Room Group B", value="\n".join(config["group_B"]), height=120)
+    unavailable_raw = st.text_area("Unavailable members（完全に除外）", value="", height=95)
+    monday_raw = st.text_area("Monday-unavailable members（月曜に来れない）", value="", height=95)
+    friday_raw = st.text_area("Friday-unavailable members（金曜に来れない）", value="", height=95)
+    has_liquid = st.checkbox("Liquid Waste を追加する", value=False)
+    return members_raw, group_A_raw, group_B_raw, unavailable_raw, monday_raw, friday_raw, has_liquid
+
+
+if view_mode == "パソコン版":
+    col_left, col_right = st.columns([1.1, 0.9])
+    with col_left:
+        members_raw = st.text_area("Members", value="\n".join(config["members"]), height=300)
+        group_A_raw = st.text_area("Student Room Group A", value="\n".join(config["group_A"]), height=130)
+        group_B_raw = st.text_area("Student Room Group B", value="\n".join(config["group_B"]), height=130)
+    with col_right:
+        unavailable_raw = st.text_area("Unavailable members（完全に除外）", value="", height=110)
+        monday_raw = st.text_area("Monday-unavailable members（月曜に来れない）", value="", height=110)
+        friday_raw = st.text_area("Friday-unavailable members（金曜に来れない）", value="", height=110)
+        has_liquid = st.checkbox("Liquid Waste を追加する", value=False)
+else:
+    members_raw, group_A_raw, group_B_raw, unavailable_raw, monday_raw, friday_raw, has_liquid = input_area()
+
+members = unique_keep_order(parse_name_list(members_raw))
+group_A_list = unique_keep_order(parse_name_list(group_A_raw))
+group_B_list = unique_keep_order(parse_name_list(group_B_raw))
+group_A = set(group_A_list)
+group_B = set(group_B_list)
+unavailable = parse_name_set(unavailable_raw)
+monday_unavail = parse_name_set(monday_raw)
+friday_unavail = parse_name_set(friday_raw)
+
 if not group_A.isdisjoint(group_B):
     st.error("Group A と Group B は重複しないようにしてください。")
     st.stop()
@@ -440,48 +555,75 @@ if len(group_A_eff) < 1 or len(group_B_eff) < 1:
     st.error("Student Room のA/Bグループの有効メンバーが足りません。")
     st.stop()
 
+col_btn1, col_btn2 = st.columns([1, 1]) if view_mode == "パソコン版" else (None, None)
 
-# =========================
-# Main
-# =========================
-if generate or "run_once" not in st.session_state:
-    st.session_state["run_once"] = True
+if view_mode == "パソコン版":
+    with col_btn1:
+        save_only = st.button("💾 メンバー設定だけ保存")
+    with col_btn2:
+        generate = st.button("🔁 掃除当番を作成 / 再作成")
+else:
+    save_only = st.button("💾 メンバー設定だけ保存")
+    generate = st.button("🔁 掃除当番を作成 / 再作成")
 
-    available_members, all_weeks, weekly_info = build_schedule(
+if save_only:
+    msg = save_config(members, group_A_list, group_B_list)
+    st.success(msg)
+
+if generate:
+    msg = save_config(members, group_A_list, group_B_list)
+    assigned, counts, warnings, unfilled, available_members = assign_schedule(
         members=members,
         unavailable=unavailable,
         monday_unavail=monday_unavail,
         friday_unavail=friday_unavail,
-        weeks=weeks,
-        liquid_weeks=liquid_weeks,
         group_A_eff=group_A_eff,
         group_B_eff=group_B_eff,
+        has_liquid=has_liquid,
     )
+    df = make_schedule_dataframe(assigned, has_liquid)
+    png_bytes = make_png_bytes(df)
 
-    df, task_columns = make_schedule_dataframe(all_weeks, liquid_weeks)
+    st.session_state["last_result"] = {
+        "df": df,
+        "png_bytes": png_bytes,
+        "counts": counts,
+        "warnings": warnings,
+        "unfilled": unfilled,
+        "available_members": available_members,
+        "save_msg": msg,
+    }
 
-    st.subheader("📅 Schedule")
-    st.dataframe(df, use_container_width=True)
+if st.session_state["last_result"] is not None:
+    result = st.session_state["last_result"]
+    st.success("掃除当番を作成しました。" + " " + result["save_msg"])
 
-    df_cnt = make_count_dataframe(df, task_columns, available_members)
-    st.subheader("📈 Assignment Counts")
-    st.dataframe(df_cnt, use_container_width=True)
-
-    with st.expander("ℹ️ Weekly adjustments & warnings"):
-        for i, (cnt, warns, unfilled) in enumerate(weekly_info, start=1):
-            st.markdown(
-                "**Week {0}** — Vacuum {1}, Mop {2}, Garbage {3}, SR {4}, DR {5}".format(
-                    i, cnt["Vacuum"], cnt["Mop"], cnt["Garbage"], cnt["Student Room"], cnt["Drying Racks"]
-                )
-            )
-            for msg in warns:
-                st.write("•", msg)
-            if unfilled:
-                st.write("未割当スロット:", ", ".join(unfilled))
+    st.subheader("📅 Cleaning Duty")
+    st.dataframe(result["df"], use_container_width=True, hide_index=True)
 
     st.download_button(
-        "⬇️ Download CSV",
-        data=df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="cleaning_schedule.csv",
-        mime="text/csv",
+        "📷 画像として保存（PNG）",
+        data=result["png_bytes"],
+        file_name="cleaning_schedule.png",
+        mime="image/png",
     )
+
+    with st.expander("ℹ️ 調整・未割当情報"):
+        counts = result["counts"]
+        st.write(
+            "Vacuum: {0}, Mop: {1}, Garbage: {2}, Student Room: {3}, Drying Racks: {4}".format(
+                counts["Vacuum"],
+                counts["Mop"],
+                counts["Garbage"],
+                counts["Student Room"],
+                counts["Drying Racks"],
+            )
+        )
+        for msg in result["warnings"]:
+            st.write("•", msg)
+        if result["unfilled"]:
+            st.write("未割当:", ", ".join(result["unfilled"]))
+        else:
+            st.write("未割当なし")
+
+        st.write("参加可能メンバー:", ", ".join(result["available_members"]))
