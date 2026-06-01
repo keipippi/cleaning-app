@@ -17,16 +17,8 @@ except Exception:
     gspread = None
     Credentials = None
 
-
-# =========================
-# Page settings
-# =========================
 st.set_page_config(page_title="Lab Cleaning Scheduler", layout="wide")
 
-
-# =========================
-# Constants
-# =========================
 LOCAL_CONFIG_PATH = Path("cleaning_config.json")
 SHEET_TAB_NAME = "settings"
 
@@ -79,9 +71,6 @@ TASK_ORDER = [
 ]
 
 
-# =========================
-# Text parsing
-# =========================
 def normalize_multiline(text: str) -> str:
     parts = re.split(r"[,/\n、]+", text)
     names = [p.strip() for p in parts if p.strip()]
@@ -106,9 +95,6 @@ def unique_keep_order(names: List[str]) -> List[str]:
     return result
 
 
-# =========================
-# Settings persistence
-# =========================
 def default_config() -> Dict[str, List[str]]:
     return {
         "members": DEFAULT_MEMBERS,
@@ -117,12 +103,29 @@ def default_config() -> Dict[str, List[str]]:
     }
 
 
-def sheet_is_available() -> bool:
+def get_service_account_info() -> Optional[dict]:
+    """Accept either a full JSON secret or the older TOML table format."""
+    if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
+        raw = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
+        if isinstance(raw, str):
+            return json.loads(raw)
+        return dict(raw)
+
+    if "gcp_service_account" in st.secrets:
+        info = dict(st.secrets["gcp_service_account"])
+        if "private_key" in info and isinstance(info["private_key"], str):
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        return info
+
+    return None
+
+
+def sheet_is_configured() -> bool:
     return (
         gspread is not None
         and Credentials is not None
-        and "gcp_service_account" in st.secrets
         and "SPREADSHEET_NAME" in st.secrets
+        and get_service_account_info() is not None
     )
 
 
@@ -131,10 +134,11 @@ def get_worksheet():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=scopes,
-    )
+    service_account_info = get_service_account_info()
+    if service_account_info is None:
+        raise RuntimeError("Google service account secret is not configured.")
+
+    creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
     client = gspread.authorize(creds)
     spreadsheet = client.open(st.secrets["SPREADSHEET_NAME"])
 
@@ -148,7 +152,7 @@ def get_worksheet():
 
 
 def load_config_from_sheet() -> Optional[Dict[str, List[str]]]:
-    if not sheet_is_available():
+    if not sheet_is_configured():
         return None
 
     try:
@@ -173,7 +177,7 @@ def load_config_from_sheet() -> Optional[Dict[str, List[str]]]:
 
 
 def save_config_to_sheet(members: List[str], group_A: List[str], group_B: List[str]) -> bool:
-    if not sheet_is_available():
+    if not sheet_is_configured():
         return False
 
     try:
@@ -195,14 +199,12 @@ def save_config_to_sheet(members: List[str], group_A: List[str], group_B: List[s
 def load_config_from_local() -> Optional[Dict[str, List[str]]]:
     if not LOCAL_CONFIG_PATH.exists():
         return None
-
     try:
         data = json.loads(LOCAL_CONFIG_PATH.read_text(encoding="utf-8"))
         if data.get("members") and data.get("group_A") and data.get("group_B"):
             return data
     except Exception:
         return None
-
     return None
 
 
@@ -229,9 +231,6 @@ def save_config(members: List[str], group_A: List[str], group_B: List[str]) -> s
     return "設定保存に失敗しました。"
 
 
-# =========================
-# Scheduling logic
-# =========================
 def adapt_counts(available_count: int, has_liquid: bool) -> Tuple[Dict[str, int], List[str]]:
     counts = dict(BASE_COUNTS)
     warnings = []
@@ -273,15 +272,12 @@ def adapt_counts(available_count: int, has_liquid: bool) -> Tuple[Dict[str, int]
 
 def build_slots(counts: Dict[str, int], has_liquid: bool) -> List[str]:
     slots = ["Student Room (A)", "Student Room (B)"]
-
     for task in TASK_ORDER:
         if task == "Student Room":
             continue
         slots.extend([task] * counts[task])
-
     if has_liquid:
         slots.insert(0, "Liquid Waste")
-
     return slots
 
 
@@ -300,7 +296,6 @@ def pick_candidate(
         pref_list = [m for m in dq if m in preferred]
         rest_list = [m for m in dq if m not in preferred]
         candidate_orders.append(pref_list + rest_list)
-
     candidate_orders.append(list(dq))
 
     for order in candidate_orders:
@@ -308,14 +303,12 @@ def pick_candidate(
         for _ in range(len(tmp)):
             cand = tmp[0]
             tmp.rotate(-1)
-
             if cand in used_this_round:
                 continue
             if cand in blacklist:
                 continue
             if required_group and cand not in required_group:
                 continue
-
             return cand, tmp
 
     return None, dq
@@ -351,9 +344,7 @@ def assign_schedule(
         if slot == "Student Room (A)":
             preferred = monday_unavail & group_A_eff
             cand, dq = pick_candidate(
-                dq,
-                used,
-                "Student Room",
+                dq, used, "Student Room",
                 required_group=group_A_eff,
                 preferred=preferred if preferred else None,
                 blacklist=base_blacklist | EXCLUDED_SR,
@@ -368,9 +359,7 @@ def assign_schedule(
         if slot == "Student Room (B)":
             preferred = monday_unavail & group_B_eff
             cand, dq = pick_candidate(
-                dq,
-                used,
-                "Student Room",
+                dq, used, "Student Room",
                 required_group=group_B_eff,
                 preferred=preferred if preferred else None,
                 blacklist=base_blacklist | EXCLUDED_SR,
@@ -387,14 +376,7 @@ def assign_schedule(
         if slot in FRIDAY_BLOCK_TASKS:
             blacklist |= friday_unavail
 
-        cand, dq = pick_candidate(
-            dq,
-            used,
-            slot,
-            preferred=preferred,
-            blacklist=blacklist,
-        )
-
+        cand, dq = pick_candidate(dq, used, slot, preferred=preferred, blacklist=blacklist)
         if cand:
             assigned[slot].append(cand)
             used.add(cand)
@@ -408,12 +390,10 @@ def make_schedule_dataframe(assigned: Dict[str, List[str]], has_liquid: bool) ->
     tasks = TASK_ORDER.copy()
     if has_liquid:
         tasks = ["Liquid Waste"] + tasks
-
     rows = []
     for task in tasks:
         people = assigned.get(task, [])
         rows.append({"Cleaning Area": task, "Member": ", ".join(people) if people else "-"})
-
     return pd.DataFrame(rows)
 
 
@@ -422,17 +402,10 @@ def make_png_bytes(df: pd.DataFrame) -> bytes:
     fig, ax = plt.subplots(figsize=(8.5, height))
     ax.axis("off")
     ax.set_title("Cleaning Duty", fontsize=18, pad=16)
-
-    table = ax.table(
-        cellText=df.values,
-        colLabels=df.columns,
-        loc="center",
-        cellLoc="center",
-    )
+    table = ax.table(cellText=df.values, colLabels=df.columns, loc="center", cellLoc="center")
     table.auto_set_font_size(False)
     table.set_fontsize(12)
     table.scale(1, 1.55)
-
     buffer = io.BytesIO()
     fig.savefig(buffer, format="png", dpi=220, bbox_inches="tight")
     plt.close(fig)
@@ -440,30 +413,14 @@ def make_png_bytes(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
-# =========================
-# Styling
-# =========================
 def apply_mobile_style():
     st.markdown(
         """
         <style>
-        .block-container {
-            padding-top: 1rem;
-            padding-left: 0.8rem;
-            padding-right: 0.8rem;
-            max-width: 760px;
-        }
-        textarea, input, button {
-            font-size: 16px !important;
-        }
-        .stButton > button, .stDownloadButton > button {
-            width: 100%;
-            border-radius: 0.8rem;
-            min-height: 3rem;
-        }
-        div[data-testid="stDataFrame"] {
-            font-size: 14px;
-        }
+        .block-container { padding-top: 1rem; padding-left: 0.8rem; padding-right: 0.8rem; max-width: 760px; }
+        textarea, input, button { font-size: 16px !important; }
+        .stButton > button, .stDownloadButton > button { width: 100%; border-radius: 0.8rem; min-height: 3rem; }
+        div[data-testid="stDataFrame"] { font-size: 14px; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -474,22 +431,14 @@ def apply_pc_style():
     st.markdown(
         """
         <style>
-        .block-container {
-            padding-top: 1.5rem;
-            max-width: 1200px;
-        }
-        .stButton > button, .stDownloadButton > button {
-            border-radius: 0.7rem;
-        }
+        .block-container { padding-top: 1.5rem; max-width: 1200px; }
+        .stButton > button, .stDownloadButton > button { border-radius: 0.7rem; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-# =========================
-# UI
-# =========================
 config = load_config()
 
 st.title("🧹 Cleaning Duty Scheduler")
@@ -501,8 +450,8 @@ if view_mode == "スマホ版":
 else:
     apply_pc_style()
 
-if sheet_is_available():
-    st.success("Googleスプレッドシート連携：有効")
+if sheet_is_configured():
+    st.success("Googleスプレッドシート連携：設定あり")
 else:
     st.info("Googleスプレッドシート連携：未設定。設定保存はローカル保存になります。")
 
@@ -555,9 +504,8 @@ if len(group_A_eff) < 1 or len(group_B_eff) < 1:
     st.error("Student Room のA/Bグループの有効メンバーが足りません。")
     st.stop()
 
-col_btn1, col_btn2 = st.columns([1, 1]) if view_mode == "パソコン版" else (None, None)
-
 if view_mode == "パソコン版":
+    col_btn1, col_btn2 = st.columns([1, 1])
     with col_btn1:
         save_only = st.button("💾 メンバー設定だけ保存")
     with col_btn2:
@@ -583,7 +531,6 @@ if generate:
     )
     df = make_schedule_dataframe(assigned, has_liquid)
     png_bytes = make_png_bytes(df)
-
     st.session_state["last_result"] = {
         "df": df,
         "png_bytes": png_bytes,
@@ -597,26 +544,19 @@ if generate:
 if st.session_state["last_result"] is not None:
     result = st.session_state["last_result"]
     st.success("掃除当番を作成しました。" + " " + result["save_msg"])
-
     st.subheader("📅 Cleaning Duty")
     st.dataframe(result["df"], use_container_width=True, hide_index=True)
-
     st.download_button(
         "📷 画像として保存（PNG）",
         data=result["png_bytes"],
         file_name="cleaning_schedule.png",
         mime="image/png",
     )
-
     with st.expander("ℹ️ 調整・未割当情報"):
         counts = result["counts"]
         st.write(
             "Vacuum: {0}, Mop: {1}, Garbage: {2}, Student Room: {3}, Drying Racks: {4}".format(
-                counts["Vacuum"],
-                counts["Mop"],
-                counts["Garbage"],
-                counts["Student Room"],
-                counts["Drying Racks"],
+                counts["Vacuum"], counts["Mop"], counts["Garbage"], counts["Student Room"], counts["Drying Racks"]
             )
         )
         for msg in result["warnings"]:
@@ -625,5 +565,4 @@ if st.session_state["last_result"] is not None:
             st.write("未割当:", ", ".join(result["unfilled"]))
         else:
             st.write("未割当なし")
-
         st.write("参加可能メンバー:", ", ".join(result["available_members"]))
