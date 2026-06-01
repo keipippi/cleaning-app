@@ -413,14 +413,52 @@ def make_png_bytes(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
+def apply_base_style():
+    st.markdown(
+        """
+        <style>
+        header[data-testid="stHeader"] {
+            height: 3.2rem;
+        }
+        .block-container {
+            padding-top: 5.2rem !important;
+            padding-bottom: 4rem !important;
+        }
+        h1 {
+            line-height: 1.18 !important;
+            margin-top: 0.4rem !important;
+            margin-bottom: 1rem !important;
+            overflow: visible !important;
+        }
+        textarea {
+            line-height: 1.45 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def apply_mobile_style():
     st.markdown(
         """
         <style>
-        .block-container { padding-top: 1rem; padding-left: 0.8rem; padding-right: 0.8rem; max-width: 760px; }
-        textarea, input, button { font-size: 16px !important; }
-        .stButton > button, .stDownloadButton > button { width: 100%; border-radius: 0.8rem; min-height: 3rem; }
-        div[data-testid="stDataFrame"] { font-size: 14px; }
+        .block-container {
+            padding-left: 0.8rem !important;
+            padding-right: 0.8rem !important;
+            max-width: 760px;
+        }
+        textarea, input, button {
+            font-size: 16px !important;
+        }
+        .stButton > button, .stDownloadButton > button {
+            width: 100%;
+            border-radius: 0.8rem;
+            min-height: 3rem;
+        }
+        div[data-testid="stDataFrame"] {
+            font-size: 14px;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -431,14 +469,19 @@ def apply_pc_style():
     st.markdown(
         """
         <style>
-        .block-container { padding-top: 1.5rem; max-width: 1200px; }
-        .stButton > button, .stDownloadButton > button { border-radius: 0.7rem; }
+        .block-container {
+            max-width: 1200px;
+        }
+        .stButton > button, .stDownloadButton > button {
+            border-radius: 0.7rem;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
+apply_base_style()
 config = load_config()
 
 st.title("🧹 Cleaning Duty Scheduler")
