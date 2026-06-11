@@ -34,8 +34,8 @@ MONDAY_PRIORITY_TASKS = {"Chip Tube", "Autoclave Waste", "Student Room", "Consum
 FRIDAY_BLOCK_TASKS = {"Chip Tube", "Autoclave Waste"}
 
 BASE_COUNTS = {
-    "Vacuum": 3,
-    "Mop": 3,
+    "Vacuum": 2,
+    "Mop": 2,
     "Garbage": 2,
     "Student Room": 2,
     "Chip Tube": 1,
@@ -45,10 +45,11 @@ BASE_COUNTS = {
     "Water alcohol": 1,
     "Consumable Goods": 1,
 }
-ADJUST_MIN = {
-    "Vacuum": 2,
-    "Mop": 2,
-    "Garbage": 2,
+
+MIN_COUNTS = {
+    "Vacuum": 1,
+    "Mop": 1,
+    "Garbage": 1,
     "Student Room": 2,
     "Chip Tube": 1,
     "Autoclave Waste": 1,
@@ -57,6 +58,36 @@ ADJUST_MIN = {
     "Water alcohol": 1,
     "Consumable Goods": 1,
 }
+
+MAX_COUNTS = {
+    "Vacuum": 3,
+    "Mop": 3,
+    "Garbage": 2,
+    "Student Room": 2,
+    "Chip Tube": 3,
+    "Autoclave Waste": 1,
+    "Autoclave Drain": 1,
+    "Drying Racks": 1,
+    "Water alcohol": 3,
+    "Consumable Goods": 1,
+}
+
+REDUCE_ORDER = [
+    ("Garbage", 1),
+    ("Vacuum", 1),
+    ("Mop", 1),
+    ("Drying Racks", 0),
+]
+
+INCREASE_ORDER = [
+    ("Chip Tube", 2),
+    ("Vacuum", 3),
+    ("Mop", 3),
+    ("Water alcohol", 2),
+    ("Chip Tube", 3),
+    ("Water alcohol", 3),
+]
+
 TASK_ORDER = [
     "Chip Tube",
     "Autoclave Waste",
@@ -96,27 +127,20 @@ def unique_keep_order(names: List[str]) -> List[str]:
 
 
 def default_config() -> Dict[str, List[str]]:
-    return {
-        "members": DEFAULT_MEMBERS,
-        "group_A": DEFAULT_GROUP_A,
-        "group_B": DEFAULT_GROUP_B,
-    }
+    return {"members": DEFAULT_MEMBERS, "group_A": DEFAULT_GROUP_A, "group_B": DEFAULT_GROUP_B}
 
 
 def get_service_account_info() -> Optional[dict]:
-    """Accept either a full JSON secret or the older TOML table format."""
     if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
         raw = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
         if isinstance(raw, str):
             return json.loads(raw)
         return dict(raw)
-
     if "gcp_service_account" in st.secrets:
         info = dict(st.secrets["gcp_service_account"])
         if "private_key" in info and isinstance(info["private_key"], str):
             info["private_key"] = info["private_key"].replace("\\n", "\n")
         return info
-
     return None
 
 
@@ -137,56 +161,46 @@ def get_worksheet():
     service_account_info = get_service_account_info()
     if service_account_info is None:
         raise RuntimeError("Google service account secret is not configured.")
-
     creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
     client = gspread.authorize(creds)
     spreadsheet = client.open(st.secrets["SPREADSHEET_NAME"])
-
     try:
         worksheet = spreadsheet.worksheet(SHEET_TAB_NAME)
     except Exception:
         worksheet = spreadsheet.add_worksheet(title=SHEET_TAB_NAME, rows=100, cols=2)
         worksheet.update("A1:B1", [["type", "name"]])
-
     return worksheet
 
 
 def load_config_from_sheet() -> Optional[Dict[str, List[str]]]:
     if not sheet_is_configured():
         return None
-
     try:
         worksheet = get_worksheet()
         records = worksheet.get_all_records()
-
         members = [str(r.get("name", "")).strip() for r in records if r.get("type") == "members"]
         group_A = [str(r.get("name", "")).strip() for r in records if r.get("type") == "group_A"]
         group_B = [str(r.get("name", "")).strip() for r in records if r.get("type") == "group_B"]
-
         members = unique_keep_order([m for m in members if m])
         group_A = unique_keep_order([m for m in group_A if m])
         group_B = unique_keep_order([m for m in group_B if m])
-
         if members and group_A and group_B:
             return {"members": members, "group_A": group_A, "group_B": group_B}
     except Exception as e:
         st.warning("Googleスプレッドシートから設定を読み込めませんでした。ローカル/初期設定を使います。")
         st.caption(str(e))
-
     return None
 
 
 def save_config_to_sheet(members: List[str], group_A: List[str], group_B: List[str]) -> bool:
     if not sheet_is_configured():
         return False
-
     try:
         worksheet = get_worksheet()
         rows = [["type", "name"]]
         rows += [["members", name] for name in members]
         rows += [["group_A", name] for name in group_A]
         rows += [["group_B", name] for name in group_B]
-
         worksheet.clear()
         worksheet.update("A1:B{}".format(len(rows)), rows)
         return True
@@ -234,39 +248,26 @@ def save_config(members: List[str], group_A: List[str], group_B: List[str]) -> s
 def adapt_counts(available_count: int, has_liquid: bool) -> Tuple[Dict[str, int], List[str]]:
     counts = dict(BASE_COUNTS)
     warnings = []
-    total_slots = sum(counts.values()) + (1 if has_liquid else 0)
-    deficit = total_slots - available_count
+    if has_liquid:
+        counts["Liquid Waste"] = 1
 
-    if deficit <= 0:
+    total_slots = sum(counts.values())
+    deficit = total_slots - available_count
+    for task, min_value in REDUCE_ORDER:
+        while deficit > 0 and counts.get(task, 0) > min_value:
+            counts[task] -= 1
+            deficit -= 1
+    if deficit > 0:
+        warnings.append("人数不足のため、いくつかの枠は未割当になります。")
         return counts, warnings
 
-    def reduce_slot(task_name: str) -> bool:
-        nonlocal deficit
-        if deficit > 0 and counts[task_name] > ADJUST_MIN[task_name]:
-            counts[task_name] -= 1
-            deficit -= 1
-            return True
-        return False
-
-    while deficit > 0:
-        changed = False
-        changed = reduce_slot("Vacuum") or changed
-        if deficit > 0:
-            changed = reduce_slot("Mop") or changed
-
-        if deficit <= 0:
-            break
-
-        if counts["Drying Racks"] > 0:
-            counts["Drying Racks"] = 0
-            deficit -= 1
-            warnings.append("人数不足のため Drying Racks を 0 にしました。")
-            changed = True
-
-        if not changed:
-            warnings.append("人数不足のため、いくつかの枠は未割当になります。")
-            break
-
+    extra = available_count - sum(counts.values())
+    for task, target_value in INCREASE_ORDER:
+        while extra > 0 and counts.get(task, 0) < target_value and counts.get(task, 0) < MAX_COUNTS[task]:
+            counts[task] += 1
+            extra -= 1
+    if extra > 0:
+        warnings.append("人数が多いため、割り当てなしのメンバーがいます。")
     return counts, warnings
 
 
@@ -275,7 +276,7 @@ def build_slots(counts: Dict[str, int], has_liquid: bool) -> List[str]:
     for task in TASK_ORDER:
         if task == "Student Room":
             continue
-        slots.extend([task] * counts[task])
+        slots.extend([task] * counts.get(task, 0))
     if has_liquid:
         slots.insert(0, "Liquid Waste")
     return slots
@@ -291,13 +292,11 @@ def pick_candidate(
 ) -> Tuple[Optional[str], Deque[str]]:
     blacklist = blacklist or set()
     candidate_orders = []
-
     if preferred:
         pref_list = [m for m in dq if m in preferred]
         rest_list = [m for m in dq if m not in preferred]
         candidate_orders.append(pref_list + rest_list)
     candidate_orders.append(list(dq))
-
     for order in candidate_orders:
         tmp = deque(order)
         for _ in range(len(tmp)):
@@ -310,7 +309,6 @@ def pick_candidate(
             if required_group and cand not in required_group:
                 continue
             return cand, tmp
-
     return None, dq
 
 
@@ -327,62 +325,44 @@ def assign_schedule(
     if not available_members:
         st.error("参加可能なメンバーが0人です。")
         st.stop()
-
     counts, warnings = adapt_counts(len(available_members), has_liquid)
     slots = build_slots(counts, has_liquid)
-
     dq_list = sorted(available_members)
     random.shuffle(dq_list)
     dq = deque(dq_list)
-
     assigned = defaultdict(list)
     used = set()
     unfilled = []
     base_blacklist = set(unavailable)
-
     for slot in slots:
         if slot == "Student Room (A)":
             preferred = monday_unavail & group_A_eff
-            cand, dq = pick_candidate(
-                dq, used, "Student Room",
-                required_group=group_A_eff,
-                preferred=preferred if preferred else None,
-                blacklist=base_blacklist | EXCLUDED_SR,
-            )
+            cand, dq = pick_candidate(dq, used, "Student Room", required_group=group_A_eff, preferred=preferred if preferred else None, blacklist=base_blacklist | EXCLUDED_SR)
             if cand:
                 assigned["Student Room"].append(cand)
                 used.add(cand)
             else:
                 unfilled.append(slot)
             continue
-
         if slot == "Student Room (B)":
             preferred = monday_unavail & group_B_eff
-            cand, dq = pick_candidate(
-                dq, used, "Student Room",
-                required_group=group_B_eff,
-                preferred=preferred if preferred else None,
-                blacklist=base_blacklist | EXCLUDED_SR,
-            )
+            cand, dq = pick_candidate(dq, used, "Student Room", required_group=group_B_eff, preferred=preferred if preferred else None, blacklist=base_blacklist | EXCLUDED_SR)
             if cand:
                 assigned["Student Room"].append(cand)
                 used.add(cand)
             else:
                 unfilled.append(slot)
             continue
-
         preferred = monday_unavail if slot in MONDAY_PRIORITY_TASKS else None
         blacklist = set(base_blacklist)
         if slot in FRIDAY_BLOCK_TASKS:
             blacklist |= friday_unavail
-
         cand, dq = pick_candidate(dq, used, slot, preferred=preferred, blacklist=blacklist)
         if cand:
             assigned[slot].append(cand)
             used.add(cand)
         else:
             unfilled.append(slot)
-
     return dict(assigned), counts, warnings, unfilled, available_members
 
 
@@ -417,22 +397,10 @@ def apply_base_style():
     st.markdown(
         """
         <style>
-        header[data-testid="stHeader"] {
-            height: 3.2rem;
-        }
-        .block-container {
-            padding-top: 5.2rem !important;
-            padding-bottom: 4rem !important;
-        }
-        h1 {
-            line-height: 1.18 !important;
-            margin-top: 0.4rem !important;
-            margin-bottom: 1rem !important;
-            overflow: visible !important;
-        }
-        textarea {
-            line-height: 1.45 !important;
-        }
+        header[data-testid="stHeader"] { height: 3.2rem; }
+        .block-container { padding-top: 5.2rem !important; padding-bottom: 4rem !important; }
+        h1 { line-height: 1.18 !important; margin-top: 0.4rem !important; margin-bottom: 1rem !important; overflow: visible !important; }
+        textarea { line-height: 1.45 !important; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -443,22 +411,10 @@ def apply_mobile_style():
     st.markdown(
         """
         <style>
-        .block-container {
-            padding-left: 0.8rem !important;
-            padding-right: 0.8rem !important;
-            max-width: 760px;
-        }
-        textarea, input, button {
-            font-size: 16px !important;
-        }
-        .stButton > button, .stDownloadButton > button {
-            width: 100%;
-            border-radius: 0.8rem;
-            min-height: 3rem;
-        }
-        div[data-testid="stDataFrame"] {
-            font-size: 14px;
-        }
+        .block-container { padding-left: 0.8rem !important; padding-right: 0.8rem !important; max-width: 760px; }
+        textarea, input, button { font-size: 16px !important; }
+        .stButton > button, .stDownloadButton > button { width: 100%; border-radius: 0.8rem; min-height: 3rem; }
+        div[data-testid="stDataFrame"] { font-size: 14px; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -469,12 +425,8 @@ def apply_pc_style():
     st.markdown(
         """
         <style>
-        .block-container {
-            max-width: 1200px;
-        }
-        .stButton > button, .stDownloadButton > button {
-            border-radius: 0.7rem;
-        }
+        .block-container { max-width: 1200px; }
+        .stButton > button, .stDownloadButton > button { border-radius: 0.7rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -598,8 +550,14 @@ if st.session_state["last_result"] is not None:
     with st.expander("ℹ️ 調整・未割当情報"):
         counts = result["counts"]
         st.write(
-            "Vacuum: {0}, Mop: {1}, Garbage: {2}, Student Room: {3}, Drying Racks: {4}".format(
-                counts["Vacuum"], counts["Mop"], counts["Garbage"], counts["Student Room"], counts["Drying Racks"]
+            "Vacuum: {0}, Mop: {1}, Garbage: {2}, Student Room: {3}, Drying Racks: {4}, Chip Tube: {5}, Water alcohol: {6}".format(
+                counts.get("Vacuum", 0),
+                counts.get("Mop", 0),
+                counts.get("Garbage", 0),
+                counts.get("Student Room", 0),
+                counts.get("Drying Racks", 0),
+                counts.get("Chip Tube", 0),
+                counts.get("Water alcohol", 0),
             )
         )
         for msg in result["warnings"]:
