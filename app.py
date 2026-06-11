@@ -74,8 +74,8 @@ MAX_COUNTS = {
 
 REDUCE_ORDER = [
     ("Garbage", 1),
-    ("Vacuum", 1),
     ("Mop", 1),
+    ("Vacuum", 1),
     ("Drying Racks", 0),
 ]
 
